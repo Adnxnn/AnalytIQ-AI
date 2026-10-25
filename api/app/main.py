@@ -139,9 +139,68 @@ def profile_uploaded(identifier:str,user_id:str=Depends(authenticated_user),auth
  if not sheets:raise HTTPException(422,"No supported worksheets")
  return {"id":identifier,"filename":"Uploaded dataset","sheets":sheets}
 
+
+def streaming_aggregate(blob:bytes,ext:str,plan:Plan):
+ if plan.operation!="groupby" or plan.aggregation=="median":
+  raise HTTPException(422,"This operation requires a background processing worker for large datasets. Count, sum, mean, min and max are available using streaming.")
+ if not plan.dimensions:raise HTTPException(422,"Select at least one grouping field")
+ if ext in (".xlsx",".xlsm"):
+  book=load_workbook(io.BytesIO(blob),read_only=True,data_only=True,keep_links=False)
+  if plan.sheet not in book.sheetnames:
+   book.close();raise HTTPException(422,"Unknown worksheet")
+  worksheet=book[plan.sheet]
+  iterator=worksheet.iter_rows(values_only=True)
+ else:
+  book=None
+  stream=io.StringIO(blob.decode("utf-8-sig",errors="replace"))
+  iterator=csv.reader(stream,delimiter="\\t" if ext==".tsv" else ",")
+ header=next(iterator,None)
+ if header is None:raise HTTPException(422,"Empty worksheet")
+ fields=[str(c) if c is not None else "" for c in header]
+ needed=[*plan.dimensions,*([plan.measure] if plan.measure else [])]
+ for name in needed:
+  if name not in fields:raise HTTPException(422,"Unknown column: "+str(name))
+ if plan.aggregation!="count" and not plan.measure:raise HTTPException(422,"Choose a numeric measure")
+ indices=[fields.index(c) for c in plan.dimensions]
+ measure_index=fields.index(plan.measure) if plan.measure else None
+ groups={}
+ total=0
+ valid_measures=0
+ try:
+  for row in iterator:
+   if not row or all(value is None or value=="" for value in row):continue
+   total+=1
+   key=tuple(str(row[i]) if i<len(row) and row[i] is not None else "" for i in indices)
+   if key not in groups:
+    if len(groups)>=1000:raise HTTPException(422,"Too many groups to display (over 1,000). Narrow your grouping.")
+    groups[key]=[0,0.0,None,None,0]
+   state=groups[key];state[0]+=1
+   if plan.aggregation!="count":
+    raw=row[measure_index] if measure_index is not None and measure_index<len(row) else None
+    try:value=float(raw)
+    except (TypeError,ValueError):continue
+    if not math.isfinite(value):continue
+    valid_measures+=1
+    state[1]+=value;state[4]+=1
+    state[2]=value if state[2] is None else min(state[2],value)
+    state[3]=value if state[3] is None else max(state[3],value)
+ finally:
+  if book is not None:book.close()
+ if plan.aggregation!="count" and not valid_measures:raise HTTPException(422,"Measure has no numeric values")
+ output=[]
+ for key,state in sorted(groups.items()):
+  count,sm,mn,mx,n=state
+  value={"count":count,"sum":sm,"mean":sm/n if n else None,"min":mn,"max":mx}[plan.aggregation]
+  output.append({**dict(zip(plan.dimensions,key)),"value":value})
+ return {"run_id":str(uuid.uuid4()),"title":plan.aggregation.title()+" by "+", ".join(plan.dimensions),"source_sheet":plan.sheet,"row_count":total,"data":output,"methodology":"Streamed source records using bounded-memory aggregation; blank groups retained; invalid numeric measure cells excluded.","checks":{"source_rows":total,"group_count":len(groups),"sum_of_group_counts":sum(v[0] for v in groups.values()) if plan.aggregation=="count" else None,"count_reconciles":sum(v[0] for v in groups.values())==total if plan.aggregation=="count" else None},"warnings":[],"chart":{"type":plan.chart,"x":plan.dimensions[0],"y":"value"}}
+
 @app.post("/datasets/{identifier}/analyze")
 def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
- try:sheets=read_sheets(*stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip()))
+ try:blob,ext=stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip())
+ except HTTPException:raise
+ except Exception as e:raise HTTPException(422,"Unreadable dataset") from e
+ if len(blob)>4*1024*1024:return streaming_aggregate(blob,ext,plan)
+ try:sheets=read_sheets(blob,ext)
  except Exception as e:raise HTTPException(422,"Unreadable dataset") from e
  if plan.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[plan.sheet].copy()
