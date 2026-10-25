@@ -14,10 +14,10 @@ export default function Login(){
  let error:Error|null=null;
  if(mode==="password"){({error}=await sb.auth.signInWithPassword({email,password}));}
  if(mode==="signup"){({error}=await sb.auth.signUp({email,password}));}
- if(mode==="magic"){({error}=await sb.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin}}));}
+ if(mode==="magic"){({error}=await sb.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin+"/"}}));}
  if(mode==="reset"){({error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:location.origin+"/login"}));}
  if(error)throw error;
- if(mode==="password")router.push("/workspace");
+ if(mode==="password")router.push("/");
  else setMessage(mode==="signup"?"Check your email to confirm your account.":mode==="reset"?"Check your email for a reset link.":"Check your email for your sign-in link.");
  }catch(e){setMessage(e instanceof Error?e.message:"Authentication failed")}finally{setBusy(false)}
  }
