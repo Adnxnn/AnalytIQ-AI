@@ -1,10 +1,11 @@
 """AnalytIQ deterministic local-development analytics API. Not internet-safe without auth."""
 from __future__ import annotations
 import hashlib,io,os,re,uuid
+import httpx
 from pathlib import Path
 from typing import Literal
 import pandas as pd
-from fastapi import FastAPI,UploadFile,File,HTTPException
+from fastapi import FastAPI,UploadFile,File,HTTPException,Depends,Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
@@ -16,6 +17,20 @@ ROOT.mkdir(parents=True,exist_ok=True)
 MAX_BYTES=int(os.getenv("MAX_UPLOAD_BYTES",str(20*1024*1024)))
 EXTS={".csv",".tsv",".xlsx",".xlsm"}
 
+SUPABASE_URL=os.getenv("SUPABASE_URL","").rstrip("/")
+def authenticated_user(authorization:str|None=Header(default=None))->str:
+ if not SUPABASE_URL:raise HTTPException(503,"Authentication not configured")
+ if not authorization or not authorization.startswith("Bearer "):raise HTTPException(401,"Authentication required")
+ try:
+  with httpx.Client(timeout=8) as client:
+   response=client.get(SUPABASE_URL+"/auth/v1/user",headers={"Authorization":authorization,"apikey":os.getenv("SUPABASE_PUBLISHABLE_KEY","")})
+  if response.status_code!=200:raise HTTPException(401,"Invalid session")
+  user_id=response.json().get("id")
+  if not user_id:raise HTTPException(401,"Invalid identity")
+  return str(user_id)
+ except httpx.RequestError as exc:raise HTTPException(503,"Auth provider unavailable") from exc
+
+
 class Plan(BaseModel):
  sheet:str
  operation:Literal["groupby","describe"]="groupby"
@@ -24,9 +39,9 @@ class Plan(BaseModel):
  aggregation:Literal["count","sum","mean","median","min","max"]="count"
  chart:Literal["bar","line"]="bar"
 
-def locate(identifier:str)->Path:
+def locate(identifier:str,user_id:str)->Path:
  if not re.fullmatch("[a-f0-9]{64}",identifier):raise HTTPException(400,"Invalid dataset identifier")
- directory=ROOT/identifier
+ directory=ROOT/user_id/identifier
  if not directory.is_dir():raise HTTPException(404,"Dataset not found")
  return directory
 
@@ -35,8 +50,8 @@ def read_sheets(path:Path)->dict[str,pd.DataFrame]:
   return pd.read_excel(path,sheet_name=None,engine="openpyxl")
  return {"Data":pd.read_csv(path,sep="\t" if path.suffix==".tsv" else ",")}
 
-def source(identifier:str)->Path:
- paths=list(locate(identifier).glob("source.*"))
+def source(identifier:str,user_id:str)->Path:
+ paths=list(locate(identifier,user_id).glob("source.*"))
  if len(paths)!=1:raise HTTPException(500,"Source file missing")
  return paths[0]
 
@@ -63,14 +78,14 @@ def profile(name:str,df:pd.DataFrame):
 def health():return {"status":"ok","mode":"unauthenticated-local-development"}
 
 @app.post("/datasets")
-async def upload(file:UploadFile=File(...)):
+async def upload(file:UploadFile=File(...),user_id:str=Depends(authenticated_user)):
  name=Path(file.filename or "upload.csv").name
  ext=Path(name).suffix.lower()
  if ext not in EXTS:raise HTTPException(415,"Unsupported file format")
  blob=await file.read(MAX_BYTES+1)
  if len(blob)>MAX_BYTES:raise HTTPException(413,"Maximum upload size exceeded")
  digest=hashlib.sha256(blob).hexdigest()
- directory=ROOT/digest
+ directory=ROOT/user_id/digest
  directory.mkdir(parents=True,exist_ok=True)
  path=directory/("source"+ext)
  if not path.exists():path.write_bytes(blob)
@@ -80,8 +95,8 @@ async def upload(file:UploadFile=File(...)):
  return {"id":digest,"filename":name,"sheets":[profile(k,v) for k,v in sheets.items()]}
 
 @app.post("/datasets/{identifier}/analyze")
-def analyze(identifier:str,plan:Plan):
- try:sheets=read_sheets(source(identifier))
+def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user)):
+ try:sheets=read_sheets(source(identifier,user_id))
  except Exception as e:raise HTTPException(422,"Unreadable dataset") from e
  if plan.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[plan.sheet].copy()
@@ -107,8 +122,8 @@ def analyze(identifier:str,plan:Plan):
  return {"run_id":str(uuid.uuid4()),"title":plan.aggregation.title()+" by "+", ".join(plan.dimensions),"source_sheet":plan.sheet,"row_count":len(df),"data":rows(out),"methodology":f"Grouped all {len(df)} records in {plan.sheet} by {plan.dimensions}; aggregation={plan.aggregation}, measure={plan.measure or 'row count'}; null groups retained.","checks":{"source_rows":len(df),"group_count":len(out),"sum_of_group_counts":int(out.value.sum()) if plan.aggregation=="count" else None,"count_reconciles":bool(int(out.value.sum())==len(df)) if plan.aggregation=="count" else None},"warnings":[],"chart":{"type":plan.chart,"x":plan.dimensions[0],"y":"value"}}
 
 @app.get("/datasets/{identifier}/export")
-def export(identifier:str,sheet:str,format:Literal["csv","xlsx"]="csv"):
- sheets=read_sheets(source(identifier))
+def export(identifier:str,sheet:str,format:Literal["csv","xlsx"]="csv",user_id:str=Depends(authenticated_user)):
+ sheets=read_sheets(source(identifier,user_id))
  if sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[sheet]
  output=io.BytesIO()
