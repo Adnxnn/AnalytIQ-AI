@@ -1,6 +1,7 @@
 """AnalytIQ deterministic local-development analytics API. Not internet-safe without auth."""
 from __future__ import annotations
-import hashlib,io,os,re,uuid
+import hashlib,io,os,re,uuid,collections,math
+from openpyxl import load_workbook
 import httpx
 from pathlib import Path
 from typing import Literal
@@ -79,6 +80,33 @@ def profile(name:str,df:pd.DataFrame):
  if int(df.duplicated().sum()):warnings.append("Duplicate rows detected")
  return {"name":name,"row_count":len(df),"column_count":len(df.columns),"columns":[{"name":str(c),"dtype":str(df[c].dtype),"missing":int(df[c].isna().sum()),"distinct":int(df[c].nunique(dropna=True))} for c in df.columns],"preview":rows(df.head(80)),"warnings":warnings}
 
+
+def lightweight_profile(blob:bytes,ext:str):
+ """Bounded-memory workbook inspection. Totals use worksheet dimensions; preview is real rows."""
+ if ext in (".xlsx",".xlsm"):
+  workbook=load_workbook(io.BytesIO(blob),read_only=True,data_only=True,keep_links=False)
+  try:
+   results=[]
+   for ws in workbook.worksheets:
+    iterator=ws.iter_rows(values_only=True)
+    header=next(iterator,None)
+    if header is None:continue
+    names=[str(x) if x is not None else "Unnamed "+str(i+1) for i,x in enumerate(header)]
+    if len(names)!=len(set(names)):raise HTTPException(422,"Duplicate column headers are unsupported")
+    samples=list(__import__("itertools").islice(iterator,80))
+    preview=[{name:safe(row[i] if i<len(row) else None) for i,name in enumerate(names)} for row in samples]
+    columns=[{"name":name,"dtype":"sampled","missing":sum(1 for row in samples if i>=len(row) or row[i] is None),"distinct":len({str(row[i]) for row in samples if i<len(row) and row[i] is not None})} for i,name in enumerate(names)]
+    results.append({"name":ws.title,"row_count":max(0,(ws.max_row or 1)-1),"column_count":len(names),"columns":columns,"preview":preview,"warnings":["Column types, missing counts and distinct counts are based on the first 80 records; row count comes from workbook dimensions. Full analyses must scan the source."]})
+   return results
+  finally:workbook.close()
+ if ext in (".csv",".tsv"):
+  sample=pd.read_csv(io.BytesIO(blob),sep="\\t" if ext==".tsv" else ",",nrows=80)
+  p=profile("Data",sample)
+  p["row_count"]=max(0,blob.count(b"\\n")-1)
+  p["warnings"].append("Row count estimated from line breaks; column statistics sampled from first 80 records.")
+  return [p]
+ raise HTTPException(415,"Unsupported dataset format")
+
 @app.get("/health")
 def health():return {"status":"ok","mode":"authenticated"}
 
@@ -105,11 +133,11 @@ def profile_uploaded(identifier:str,user_id:str=Depends(authenticated_user),auth
  try:
   blob,ext=stored_source(identifier,user_id,token)
   if len(blob)>MAX_BYTES:raise HTTPException(413,"File exceeds server processing limit")
-  sheets=read_sheets(blob,ext)
+  sheets=lightweight_profile(blob,ext)
  except HTTPException:raise
  except Exception as e:raise HTTPException(422,"Unable to inspect uploaded file") from e
  if not sheets:raise HTTPException(422,"No supported worksheets")
- return {"id":identifier,"filename":"Uploaded dataset","sheets":[profile(name,frame) for name,frame in sheets.items()]}
+ return {"id":identifier,"filename":"Uploaded dataset","sheets":sheets}
 
 @app.post("/datasets/{identifier}/analyze")
 def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
