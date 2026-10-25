@@ -81,6 +81,21 @@ def profile(name:str,df:pd.DataFrame):
  return {"name":name,"row_count":len(df),"column_count":len(df.columns),"columns":[{"name":str(c),"dtype":str(df[c].dtype),"missing":int(df[c].isna().sum()),"distinct":int(df[c].nunique(dropna=True))} for c in df.columns],"preview":rows(df.head(80)),"warnings":warnings}
 
 
+def detect_header(iterator):
+ """Scan up to 30 early rows for a likely labeled table header."""
+ import itertools
+ sampled=list(itertools.islice(iterator,30))
+ if not sampled: return None,iter(())
+ def score(row):
+  values=[str(v).strip() for v in row if v is not None and str(v).strip()]
+  text=[v for v in values if not v.replace(".","",1).isdigit()]
+  unique=len(set(v.lower() for v in text))
+  meaningful=sum(len(v)>2 and not v.lower().startswith("unnamed") for v in text)
+  return (meaningful>=2)*30 + min(unique,25)*3 + meaningful - (len(values)-unique)*2
+ ranked=sorted(range(len(sampled)),key=lambda i:(score(sampled[i]),-i),reverse=True)
+ index=ranked[0]
+ return sampled[index],itertools.chain(sampled[index+1:],iterator)
+
 def lightweight_profile(blob:bytes,ext:str):
  """Bounded-memory workbook inspection. Totals use worksheet dimensions; preview is real rows."""
  if ext in (".xlsx",".xlsm"):
@@ -89,7 +104,7 @@ def lightweight_profile(blob:bytes,ext:str):
    results=[]
    for ws in workbook.worksheets:
     iterator=ws.iter_rows(values_only=True)
-    header=next(iterator,None)
+    header,iterator=detect_header(iterator)
     if header is None:continue
     names=[str(x) if x is not None else "Unnamed "+str(i+1) for i,x in enumerate(header)]
     if len(names)!=len(set(names)):raise HTTPException(422,"Duplicate column headers are unsupported")
@@ -154,7 +169,7 @@ def streaming_aggregate(blob:bytes,ext:str,plan:Plan):
   book=None
   stream=io.StringIO(blob.decode("utf-8-sig",errors="replace"))
   iterator=csv.reader(stream,delimiter="\\t" if ext==".tsv" else ",")
- header=next(iterator,None)
+ header,iterator=detect_header(iterator)
  if header is None:raise HTTPException(422,"Empty worksheet")
  fields=[str(c) if c is not None else "" for c in header]
  needed=[*plan.dimensions,*([plan.measure] if plan.measure else [])]
