@@ -4,7 +4,7 @@ type Project={id:string;name:string;created_at:string};
 export default function Workspace(){
  const [user,setUser]=useState<User|null>(null);const [projects,setProjects]=useState<Project[]>([]);const [name,setName]=useState("");const [loading,setLoading]=useState(true);const [message,setMessage]=useState("");const router=useRouter();
  useEffect(()=>{const sb=getSupabase();if(!sb){setMessage("Supabase is not configured");setLoading(false);return;}let live=true;
- async function load(){const {data:{user},error}=await sb.auth.getUser();if(!live)return;if(error||!user){router.replace("/login");return;}setUser(user);const result=await sb.from("projects").select("id,name,created_at").order("created_at",{ascending:false});if(!live)return;if(result.error)setMessage(result.error.message);else setProjects(result.data||[]);setLoading(false)}
+ async function load(){if(!sb)return;const {data:{user},error}=await sb.auth.getUser();if(!live)return;if(error||!user){router.replace("/login");return;}setUser(user);const result=await sb.from("projects").select("id,name,created_at").order("created_at",{ascending:false});if(!live)return;if(result.error)setMessage(result.error.message);else setProjects(result.data||[]);setLoading(false)}
  load();const {data:sub}=sb.auth.onAuthStateChange((_event,session)=>{if(!session)router.replace("/login")});return()=>{live=false;sub.subscription.unsubscribe()}
  },[router]);
  async function create(){const sb=getSupabase();if(!sb||!user||!name.trim())return;const result=await sb.from("projects").insert({name:name.trim(),owner_id:user.id}).select("id,name,created_at").single();if(result.error){setMessage(result.error.message);return;}setProjects([result.data,...projects]);setName("")}
