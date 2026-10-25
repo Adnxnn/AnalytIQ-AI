@@ -23,9 +23,10 @@ export default function Home(){
    const empty=/^(draft|sheet\\d*|documentation|report catalog)/i.test(sheet.name)?-10:0;
    return matches*10+status+data+Math.min(clean,20)/10+empty;
   };
-  const requested=[...eligible].sort((a,b)=>rank(b)-rank(a))[0];
-  if(!requested)throw new Error("No usable data headers were detected in this workbook. The Excel reader needs to inspect header rows below row one.");
+  const requested=[...(eligible.length?eligible:d.sheets)].sort((a,b)=>rank(b)-rank(a))[0];
+  if(!requested)throw new Error("No worksheets were found. Re-import the file to refresh its metadata.");
   const columns=requested.columns.filter(c=>c.name.trim()&&!/^unnamed(?:\\s|:|$)/i.test(c.name));
+  if(!columns.length)throw new Error("This worksheet was inspected before improved header detection was deployed. Re-import the same file to refresh its headers; your existing upload is already stored.");
   const matched=columns.filter(c=>lower.includes(c.name.toLowerCase())).sort((a,b)=>b.name.length-a.name.length);
   const by=lower.match(/\bby\s+([^?.,]+)/)?.[1]?.trim();
   const group=matched.find(c=>by?.includes(c.name.toLowerCase()))||matched.find(c=>!/(amount|revenue|sales|price|cost|profit|quantity)/i.test(c.name))||columns.find(c=>/status|category|region|industry|year|month|type|phase|product/i.test(c.name))||columns[0];
