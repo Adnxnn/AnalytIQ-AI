@@ -39,21 +39,26 @@ class Plan(BaseModel):
  aggregation:Literal["count","sum","mean","median","min","max"]="count"
  chart:Literal["bar","line"]="bar"
 
-def locate(identifier:str,user_id:str)->Path:
- if not re.fullmatch("[a-f0-9]{64}",identifier):raise HTTPException(400,"Invalid dataset identifier")
- directory=ROOT/user_id/identifier
- if not directory.is_dir():raise HTTPException(404,"Dataset not found")
- return directory
+def storage_headers(token: str):
+ return {"Authorization": "Bearer " + token, "apikey": os.environ["SUPABASE_PUBLISHABLE_KEY"]}
 
-def read_sheets(path:Path)->dict[str,pd.DataFrame]:
- if path.suffix in (".xlsx",".xlsm"):
-  return pd.read_excel(path,sheet_name=None,engine="openpyxl")
- return {"Data":pd.read_csv(path,sep="\t" if path.suffix==".tsv" else ",")}
+def read_sheets(blob: bytes, ext: str):
+ stream=io.BytesIO(blob)
+ if ext in (".xlsx",".xlsm"):
+  return pd.read_excel(stream,sheet_name=None,engine="openpyxl")
+ return {"Data":pd.read_csv(stream,sep="\t" if ext==".tsv" else ",")}
 
-def source(identifier:str,user_id:str)->Path:
- paths=list(locate(identifier,user_id).glob("source.*"))
- if len(paths)!=1:raise HTTPException(500,"Source file missing")
- return paths[0]
+def stored_source(identifier: str, user_id: str, token: str):
+ if not re.fullmatch(r"[a-f0-9]{64}",identifier):raise HTTPException(400,"Invalid identifier")
+ with httpx.Client(timeout=30) as client:
+  r=client.post(SUPABASE_URL+"/storage/v1/object/list/analytiq-originals",headers=storage_headers(token),json={"prefix":user_id+"/"+identifier,"limit":10})
+  if r.status_code!=200:raise HTTPException(502,"Storage listing failed")
+  matches=[x["name"] for x in r.json() if x.get("name","").startswith(identifier+".")]
+  if len(matches)!=1:raise HTTPException(404,"Dataset unavailable")
+  name=matches[0]
+  r=client.get(SUPABASE_URL+"/storage/v1/object/authenticated/analytiq-originals/"+user_id+"/"+name,headers=storage_headers(token))
+  if r.status_code!=200:raise HTTPException(404,"Source not found")
+  return r.content,Path(name).suffix
 
 def safe(v):
  if pd.isna(v):return None
@@ -75,28 +80,28 @@ def profile(name:str,df:pd.DataFrame):
  return {"name":name,"row_count":len(df),"column_count":len(df.columns),"columns":[{"name":str(c),"dtype":str(df[c].dtype),"missing":int(df[c].isna().sum()),"distinct":int(df[c].nunique(dropna=True))} for c in df.columns],"preview":rows(df.head(80)),"warnings":warnings}
 
 @app.get("/health")
-def health():return {"status":"ok","mode":"unauthenticated-local-development"}
+def health():return {"status":"ok","mode":"authenticated"}
 
 @app.post("/datasets")
-async def upload(file:UploadFile=File(...),user_id:str=Depends(authenticated_user)):
+async def upload(file:UploadFile=File(...),user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
  name=Path(file.filename or "upload.csv").name
  ext=Path(name).suffix.lower()
  if ext not in EXTS:raise HTTPException(415,"Unsupported file format")
  blob=await file.read(MAX_BYTES+1)
  if len(blob)>MAX_BYTES:raise HTTPException(413,"Maximum upload size exceeded")
  digest=hashlib.sha256(blob).hexdigest()
- directory=ROOT/user_id/digest
- directory.mkdir(parents=True,exist_ok=True)
- path=directory/("source"+ext)
- if not path.exists():path.write_bytes(blob)
- try:sheets=read_sheets(path)
+ try:sheets=read_sheets(blob,ext)
  except Exception as e:raise HTTPException(422,"Could not parse dataset") from e
+ token=authorization.removeprefix("Bearer ").strip()
+ with httpx.Client(timeout=30) as client:
+  r=client.post(SUPABASE_URL+"/storage/v1/object/analytiq-originals/"+user_id+"/"+digest+ext,headers={**storage_headers(token),"Content-Type":"application/octet-stream","x-upsert":"false"},content=blob)
+ if r.status_code not in (200,201,409):raise HTTPException(502,"Storage upload failed")
  if not sheets:raise HTTPException(422,"No worksheets")
  return {"id":digest,"filename":name,"sheets":[profile(k,v) for k,v in sheets.items()]}
 
 @app.post("/datasets/{identifier}/analyze")
-def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user)):
- try:sheets=read_sheets(source(identifier,user_id))
+def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
+ try:sheets=read_sheets(*stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip()))
  except Exception as e:raise HTTPException(422,"Unreadable dataset") from e
  if plan.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[plan.sheet].copy()
@@ -122,8 +127,8 @@ def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user)):
  return {"run_id":str(uuid.uuid4()),"title":plan.aggregation.title()+" by "+", ".join(plan.dimensions),"source_sheet":plan.sheet,"row_count":len(df),"data":rows(out),"methodology":f"Grouped all {len(df)} records in {plan.sheet} by {plan.dimensions}; aggregation={plan.aggregation}, measure={plan.measure or 'row count'}; null groups retained.","checks":{"source_rows":len(df),"group_count":len(out),"sum_of_group_counts":int(out.value.sum()) if plan.aggregation=="count" else None,"count_reconciles":bool(int(out.value.sum())==len(df)) if plan.aggregation=="count" else None},"warnings":[],"chart":{"type":plan.chart,"x":plan.dimensions[0],"y":"value"}}
 
 @app.get("/datasets/{identifier}/export")
-def export(identifier:str,sheet:str,format:Literal["csv","xlsx"]="csv",user_id:str=Depends(authenticated_user)):
- sheets=read_sheets(source(identifier,user_id))
+def export(identifier:str,sheet:str,format:Literal["csv","xlsx"]="csv",user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
+ sheets=read_sheets(*stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip()))
  if sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[sheet]
  output=io.BytesIO()
