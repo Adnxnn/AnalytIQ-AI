@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
 
 app=FastAPI(title="AnalytIQ Analytics Engine",version="0.1.0")
-app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("ALLOWED_ORIGINS","http://localhost:3000").split(",")],allow_methods=["GET","POST"],allow_headers=["Content-Type"])
+app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("ALLOWED_ORIGINS","http://localhost:3000").split(",")],allow_methods=["GET","POST"],allow_headers=["Content-Type","Authorization","Accept"])
 ROOT=Path(os.getenv("DATA_DIR","/tmp/analytiq-data"))
 ROOT.mkdir(parents=True,exist_ok=True)
 MAX_BYTES=int(os.getenv("MAX_UPLOAD_BYTES",str(20*1024*1024)))
