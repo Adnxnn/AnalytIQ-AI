@@ -4,7 +4,7 @@ function api(){if(!url)throw new Error("Analysis API is not configured. Public u
  const sb=getSupabase();if(!sb)throw new Error("Supabase is not configured");
  const {data:{user},error:userError}=await sb.auth.getUser();
  if(userError||!user)throw new Error("Sign in again before uploading");
- if(file.size>20*1024*1024)throw new Error("Maximum file size is 20 MB for this release. Larger datasets require resumable storage and a worker.");
+ if(file.size>50*1024*1024)throw new Error("Maximum file size for this storage tier is 50 MB. Larger files need a higher storage limit and a dedicated processing worker.");
  const ext=file.name.toLowerCase().split(".").pop();
  if(!ext||!["xlsx","xlsm","csv","tsv"].includes(ext))throw new Error("Supported uploads: XLSX, XLSM, CSV and TSV");
  const buffer=await file.arrayBuffer();
