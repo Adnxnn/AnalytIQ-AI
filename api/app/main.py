@@ -91,7 +91,8 @@ def detect_header(iterator):
   text=[v for v in values if not v.replace(".","",1).isdigit()]
   unique=len(set(v.lower() for v in text))
   meaningful=sum(len(v)>2 and not v.lower().startswith("unnamed") for v in text)
-  return (meaningful>=2)*30 + min(unique,25)*3 + meaningful - (len(values)-unique)*2
+  keywords=sum(bool(re.search(r"status|opportunit|date|amount|revenue|client|industr|probabilit|leader|phase|region|category|name|id|description|year|month|value|sales",v,re.I)) for v in text)
+  return (meaningful>=2)*30 + min(unique,25)*3 + meaningful + keywords*10 - (len(values)-unique)*2
  ranked=sorted(range(len(sampled)),key=lambda i:(score(sampled[i]),-i),reverse=True)
  index=ranked[0]
  return sampled[index],itertools.chain(sampled[index+1:],iterator)
