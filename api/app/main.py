@@ -51,7 +51,7 @@ def read_sheets(blob: bytes, ext: str):
 def stored_source(identifier: str, user_id: str, token: str):
  if not re.fullmatch(r"[a-f0-9]{64}",identifier):raise HTTPException(400,"Invalid identifier")
  with httpx.Client(timeout=30) as client:
-  r=client.post(SUPABASE_URL+"/storage/v1/object/list/analytiq-originals",headers=storage_headers(token),json={"prefix":user_id+"/"+identifier,"limit":10})
+  r=client.post(SUPABASE_URL+"/storage/v1/object/list/analytiq-originals",headers=storage_headers(token),json={"prefix":user_id,"limit":1000})
   if r.status_code!=200:raise HTTPException(502,"Storage listing failed")
   matches=[x["name"] for x in r.json() if x.get("name","").startswith(identifier+".")]
   if len(matches)!=1:raise HTTPException(404,"Dataset unavailable")
