@@ -99,6 +99,18 @@ async def upload(file:UploadFile=File(...),user_id:str=Depends(authenticated_use
  if not sheets:raise HTTPException(422,"No worksheets")
  return {"id":digest,"filename":name,"sheets":[profile(k,v) for k,v in sheets.items()]}
 
+@app.get("/datasets/{identifier}/profile")
+def profile_uploaded(identifier:str,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
+ token=authorization.removeprefix("Bearer ").strip()
+ try:
+  blob,ext=stored_source(identifier,user_id,token)
+  if len(blob)>MAX_BYTES:raise HTTPException(413,"File exceeds server processing limit")
+  sheets=read_sheets(blob,ext)
+ except HTTPException:raise
+ except Exception as e:raise HTTPException(422,"Unable to inspect uploaded file") from e
+ if not sheets:raise HTTPException(422,"No supported worksheets")
+ return {"id":identifier,"filename":"Uploaded dataset","sheets":[profile(name,frame) for name,frame in sheets.items()]}
+
 @app.post("/datasets/{identifier}/analyze")
 def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
  try:sheets=read_sheets(*stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip()))
