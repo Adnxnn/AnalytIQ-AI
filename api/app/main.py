@@ -1,6 +1,6 @@
 """AnalytIQ deterministic local-development analytics API. Not internet-safe without auth."""
 from __future__ import annotations
-import hashlib,io,os,re,uuid,collections,math
+import hashlib,io,os,re,uuid,collections,math,csv
 from openpyxl import load_workbook
 import httpx
 from pathlib import Path
@@ -34,7 +34,7 @@ def authenticated_user(authorization:str|None=Header(default=None))->str:
 
 class Plan(BaseModel):
  sheet:str
- operation:Literal["groupby","describe"]="groupby"
+ operation:Literal["groupby","describe","count"]="groupby"
  dimensions:list[str]=Field(default_factory=list,max_length=3)
  measure:str|None=None
  aggregation:Literal["count","sum","mean","median","min","max"]="count"
@@ -157,9 +157,9 @@ def profile_uploaded(identifier:str,user_id:str=Depends(authenticated_user),auth
 
 
 def streaming_aggregate(blob:bytes,ext:str,plan:Plan):
- if plan.operation!="groupby" or plan.aggregation=="median":
+ if plan.operation not in ("groupby","count") or plan.aggregation=="median":
   raise HTTPException(422,"This operation requires a background processing worker for large datasets. Count, sum, mean, min and max are available using streaming.")
- if not plan.dimensions:raise HTTPException(422,"Select at least one grouping field")
+ if plan.operation=="groupby" and not plan.dimensions:raise HTTPException(422,"Select at least one grouping field")
  if ext in (".xlsx",".xlsm"):
   book=load_workbook(io.BytesIO(blob),read_only=True,data_only=True,keep_links=False)
   if plan.sheet not in book.sheetnames:
@@ -169,7 +169,7 @@ def streaming_aggregate(blob:bytes,ext:str,plan:Plan):
  else:
   book=None
   stream=io.StringIO(blob.decode("utf-8-sig",errors="replace"))
-  iterator=csv.reader(stream,delimiter="\\t" if ext==".tsv" else ",")
+  iterator=csv.reader(stream,delimiter="\t" if ext==".tsv" else ",")
  header,iterator=detect_header(iterator)
  if header is None:raise HTTPException(422,"Empty worksheet")
  fields=[str(c) if c is not None else "" for c in header]
@@ -208,7 +208,7 @@ def streaming_aggregate(blob:bytes,ext:str,plan:Plan):
   count,sm,mn,mx,n=state
   value={"count":count,"sum":sm,"mean":sm/n if n else None,"min":mn,"max":mx}[plan.aggregation]
   output.append({**dict(zip(plan.dimensions,key)),"value":value})
- return {"run_id":str(uuid.uuid4()),"title":plan.aggregation.title()+" by "+", ".join(plan.dimensions),"source_sheet":plan.sheet,"row_count":total,"data":output,"methodology":"Streamed source records using bounded-memory aggregation; blank groups retained; invalid numeric measure cells excluded.","checks":{"source_rows":total,"group_count":len(groups),"sum_of_group_counts":sum(v[0] for v in groups.values()) if plan.aggregation=="count" else None,"count_reconciles":sum(v[0] for v in groups.values())==total if plan.aggregation=="count" else None},"warnings":[],"chart":{"type":plan.chart,"x":plan.dimensions[0],"y":"value"}}
+ return {"run_id":str(uuid.uuid4()),"title":("Total rows" if plan.operation=="count" else plan.aggregation.title()+" by "+", ".join(plan.dimensions)),"source_sheet":plan.sheet,"row_count":total,"data":([{"metric":"Rows","value":total}] if plan.operation=="count" else output),"methodology":"Streamed source records using bounded-memory aggregation; blank groups retained; invalid numeric measure cells excluded.","checks":{"source_rows":total,"group_count":len(groups),"sum_of_group_counts":sum(v[0] for v in groups.values()) if plan.aggregation=="count" else None,"count_reconciles":sum(v[0] for v in groups.values())==total if plan.aggregation=="count" else None},"warnings":[],"chart":(None if plan.operation=="count" else {"type":plan.chart,"x":plan.dimensions[0],"y":"value"})}
 
 @app.post("/datasets/{identifier}/analyze")
 def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
@@ -221,6 +221,8 @@ def analyze(identifier:str,plan:Plan,user_id:str=Depends(authenticated_user),aut
  if plan.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
  df=sheets[plan.sheet].copy()
  df.columns=[str(c) for c in df.columns]
+ if plan.operation=="count":
+  return {"run_id":str(uuid.uuid4()),"title":"Total rows","source_sheet":plan.sheet,"row_count":len(df),"data":[{"metric":"Rows","value":len(df)}],"methodology":"Counted parsed records in the selected worksheet; no grouping field or numeric measure required.","checks":{"source_rows":len(df),"count_reconciles":True},"warnings":[],"chart":None}
  if plan.operation=="describe":
   out=df.describe(include="all").reset_index().rename(columns={"index":"Statistic"})
   return {"run_id":str(uuid.uuid4()),"title":"Dataset descriptive statistics","source_sheet":plan.sheet,"row_count":len(df),"data":rows(out.fillna("")),"methodology":"Pandas describe(include=all), no synthetic statistics.","checks":{"source_rows":len(df)},"warnings":[]}
@@ -255,3 +257,54 @@ def export(identifier:str,sheet:str,format:Literal["csv","xlsx"]="csv",user_id:s
   media="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
  output.seek(0)
  return StreamingResponse(output,media_type=media,headers={"Content-Disposition":f'attachment; filename="analytiq-export.{format}"'})
+
+
+class CleaningOptions(BaseModel):
+ sheet:str
+ remove_duplicates:bool=True
+ trim_whitespace:bool=True
+ drop_empty_rows:bool=True
+ drop_empty_columns:bool=True
+ missing_strategy:Literal["keep","drop_rows","fill_text","fill_zero"]="keep"
+
+def cleaned_frame(df:pd.DataFrame,opts:CleaningOptions):
+ df=df.copy()
+ before=len(df)
+ blanks_before=int(df.isna().sum().sum())
+ if opts.trim_whitespace:
+  for col in df.select_dtypes(include=["object"]).columns:
+   df[col]=df[col].map(lambda x:x.strip() if isinstance(x,str) else x)
+   df[col]=df[col].replace("",pd.NA)
+ duplicates=int(df.duplicated().sum())
+ if opts.drop_empty_rows:df=df.dropna(how="all")
+ if opts.drop_empty_columns:df=df.dropna(axis=1,how="all")
+ if opts.remove_duplicates:df=df.drop_duplicates()
+ if opts.missing_strategy=="drop_rows":df=df.dropna()
+ elif opts.missing_strategy=="fill_text":
+  for col in df.select_dtypes(include=["object","string"]).columns:df[col]=df[col].fillna("Missing")
+ elif opts.missing_strategy=="fill_zero":
+  for col in df.select_dtypes(include=["number"]).columns:df[col]=df[col].fillna(0)
+ return df,{"rows_before":before,"rows_after":len(df),"rows_removed":before-len(df),"duplicate_rows_detected":duplicates,"missing_cells_before":blanks_before,"missing_cells_after":int(df.isna().sum().sum()),"columns_after":len(df.columns)}
+
+@app.post("/datasets/{identifier}/clean/preview")
+def clean_preview(identifier:str,options:CleaningOptions,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
+ blob,ext=stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip())
+ if len(blob)>MAX_BYTES:raise HTTPException(413,"File exceeds processing limit")
+ try:sheets=read_sheets(blob,ext)
+ except Exception as e:raise HTTPException(422,"Could not read source workbook") from e
+ if options.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
+ cleaned,report=cleaned_frame(sheets[options.sheet],options)
+ return {"report":report,"preview":rows(cleaned.head(30)),"columns":list(map(str,cleaned.columns)),"warning":"Preview only. Original uploaded file is unchanged. Review before downloading."}
+
+@app.post("/datasets/{identifier}/clean/download")
+def clean_download(identifier:str,options:CleaningOptions,user_id:str=Depends(authenticated_user),authorization:str=Header(...)):
+ blob,ext=stored_source(identifier,user_id,authorization.removeprefix("Bearer ").strip())
+ if len(blob)>MAX_BYTES:raise HTTPException(413,"File exceeds processing limit")
+ try:sheets=read_sheets(blob,ext)
+ except Exception as e:raise HTTPException(422,"Could not read source workbook") from e
+ if options.sheet not in sheets:raise HTTPException(422,"Unknown worksheet")
+ cleaned,_=cleaned_frame(sheets[options.sheet],options)
+ out=io.BytesIO()
+ with pd.ExcelWriter(out,engine="openpyxl") as writer:cleaned.to_excel(writer,index=False,sheet_name="Cleaned")
+ out.seek(0)
+ return StreamingResponse(out,media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":'attachment; filename="analytiq-cleaned.xlsx"'})
